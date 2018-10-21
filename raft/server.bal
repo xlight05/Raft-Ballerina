@@ -8,68 +8,101 @@ endpoint grpc:Listener listener {
     port: config:getAsInt("port", default = 7000)
 };
 
-map<boolean> voteLog;
-boolean initVoteLog = voteLogInit();
+//map<boolean> voteLog;
+//boolean initVoteLog = voteLogInit();
 
-public type VoteRequest record{
-    int term;
-    string candidateID;
-    int lastLogIndex;
-    int lastLogTerm;
-};
+// public type VoteRequest record{
+//     int term;
+//     string candidateID;
+//     int lastLogIndex;
+//     int lastLogTerm;
+// };
 
-public type VoteResponse record{
-    boolean granted;
-    int term;
-};
+// public type VoteResponse record{
+//     boolean granted;
+//     int term;
+// };
 
-public type AppendEntries record {
-    int term;
-    string leaderID;
-    int prevLogIndex;
-    int prevLogTerm;
-    LogEntry[] entries;
-    int leaderCommit;
-};
+// public type AppendEntries record {
+//     int term;
+//     string leaderID;
+//     int prevLogIndex;
+//     int prevLogTerm;
+//     LogEntry[] entries;
+//     int leaderCommit;
+// };
 
-public type AppendEntriesResponse record {
-    int term;
-    boolean sucess;
-    int followerMatchIndex;
+// public type AppendEntriesResponse record {
+//     int term;
+//     boolean sucess;
+//     int followerMatchIndex;
 
-};
+// };
+//  public type LogEntry record {
+//      int term;
+//      string command;
+//  };
+//  type ConfigChangeResponse record{
+//     boolean sucess;
+//     string leaderHint;
+// };
 //
 //AppendEntries(term, leaderID, prevLogIndex, prevLogTerm, entries[], leaderCommit)
 //-> (term, conflictIndex, conflictTerm, success)
 service raft bind listener {
-
-    voteResponse(endpoint caller, VoteRequest voteReq, grpc:Headers headers) {
+    //Internal
+    voteResponseRPC(endpoint caller, VoteRequest voteReq, grpc:Headers headers) {
+        log:printInfo("Vote request came from " + voteReq.candidateID);
         boolean granted = voteResponseHandle(voteReq);
         VoteResponse res = { granted: granted, term: currentTerm };
         error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Server send response : " +
+        log:printInfo(err.message but { () => "vote response " +
                 res.term + " " + res.granted });
 
         _ = caller->complete();
     }
-
-
-
-    appendEntries(endpoint caller, AppendEntries appendEntry, grpc:Headers headers) {
+    appendEntriesRPC(endpoint caller, AppendEntries appendEntry, grpc:Headers headers) {
+        log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
         AppendEntriesResponse res = heartbeatHandle(appendEntry);
         error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Server send response : " +
+        log:printInfo(err.message but { () => "Append RPC response " +
                 res.term + " " + res.sucess });
+        _ = caller->complete();
+    }
+
+    //External
+    addServerRPC(endpoint caller, string ip, grpc:Headers headers) {
+        ConfigChangeResponse res = addNode(ip);
+        error? err = caller->send(res);
+        log:printInfo(err.message but { () => "Add server response : " +
+                res.sucess + " " + res.leaderHint });
+
+        _ = caller->complete();
+    }
+
+    clientRequestRPC(endpoint caller, string command, grpc:Headers headers) {
+        boolean sucess = clientRequest(command);
+        ConfigChangeResponse res = { sucess: sucess, leaderHint: "noneee" };
+        error? err = caller->send(res);
+        log:printInfo(err.message but { () => "Client RPC Response : " +
+                res.sucess + " " + res.leaderHint });
 
         _ = caller->complete();
     }
 }
 
-public function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesResponse {
+function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesResponse {
+    if (state == "Follower") {
+        resetElectionTimer();
+    }
     //initLog();
     AppendEntriesResponse res;
     if (currentTerm < appendEntry.term) {
         //stepdown
+        currentTerm = untaint appendEntry.term;
+        state = "Follower";
+        votedFor = "None";
+        heartbeatTimer.stop();
     }
     if (currentTerm > appendEntry.term) {
         res = { term: currentTerm, sucess: false };
@@ -85,9 +118,10 @@ public function heartbeatHandle(AppendEntries appendEntry) returns AppendEntries
             foreach i in appendEntry.entries{
                 index++;
                 if (getTerm(index) != i.term) {
-                    log[index] = i;//not sure
+                    log[index-1] = i;//not sure
                 }
             }
+            index = index-1;
             commitIndex = untaint min(appendEntry.leaderCommit, index);
         } else {
             index = 0;
@@ -95,19 +129,23 @@ public function heartbeatHandle(AppendEntries appendEntry) returns AppendEntries
         res = { term: currentTerm, sucess: sucess, followerMatchIndex: index };
 
     }
-    io:println(res);
-    io:println(log);
+    if (commitIndex > lastApplied) {
+        foreach i in lastApplied + 1...commitIndex {
+            apply(log[i].command);
+            lastApplied = i;
+        }
+    }
     return res;
 }
 
 
 
-function voteLogInit() returns boolean {
-    foreach node in nodeList {
-        voteLog[node] = false;
-    }
-    return true;
-}
+//function voteLogInit() returns boolean {
+//    foreach node in nodeList {
+//        voteLog[node] = false;
+//    }
+//    return true;
+//}
 
 function voteResponseHandle(VoteRequest voteReq) returns boolean {
     boolean granted;
@@ -116,6 +154,7 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         currentTerm = untaint term;
         state = "Follower";
         votedFor = "None";
+        startElectionTimer();
         //Leader variable init
     }
     if (term < currentTerm) {
@@ -134,7 +173,7 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         return (false);
     }
 
-    if (voteReq.lastLogTerm == ourLastLogTerm && voteReq.lastLogIndex < ourLastLogIndex) {
+    if (voteReq.lastLogTerm == ourLastLogTerm && voteReq.lastLogIndex < ourLastLogIndex) { //checkk
         return (false);
     }
 

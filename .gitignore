@@ -1,4 +1,7 @@
 .idea/
 .ballerina/
 target/
-
+Test.bal
+raft/serverTest.bal
+raft/Main.bal
+ballerina-internal.log
