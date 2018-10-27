@@ -9,12 +9,20 @@ import ballerina/config;
 //TODO make proper election timeout with MIN MAX timeout
 //TODO make proper hearbeat timeout
 //TODO Test dynamic node changes
+//TODO LOCKS
+//TODO LAG Test
+//TODO Partition Test
+//TODO Merge with cache
+
 
 endpoint raftBlockingClient blockingEp {
     url: "http://localhost:3000"
 };
 
 map<raftBlockingClient> clientMap;
+int MIN_ELECTION_TIMEOUT = 2000;
+int MAX_ELECTION_TIMEOUT = 2250;
+int HEARTBEAT_TIMEOUT = 1000;
 
 string leader;
 string state = "Follower";
@@ -31,6 +39,9 @@ map<int> candVoteLog;
 map<int> nextIndex;
 map<int> matchIndex;
 
+//failure detector
+map <raftBlockingClient> suspectNodes;
+
 public function startRaft() {
     //cheat for first node lol
     log[lengthof log] = { term: 1, command: "NA "+currentNode };
@@ -45,7 +56,7 @@ public function startRaft() {
     matchIndex[currentNode] = 0;
 
 
-    int interval = math:randomInRange(150, 300);
+    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
 
     (function () returns error?) onTriggerFunction = electLeader;
 
@@ -61,7 +72,7 @@ public function joinRaft() {
     matchIndex[currentNode] = 0;
 
 
-    int interval = math:randomInRange(150, 300);
+    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
 
     (function () returns error?) onTriggerFunction = electLeader;
 
@@ -76,6 +87,7 @@ function electLeader() returns error? {
     log:printInfo("Starting Leader Election by "+currentNode);
     //addNodes();//temp
     if (state == "Leader") {
+        timer.stop();
         return;
     }
     currentTerm++;
@@ -84,9 +96,8 @@ function electLeader() returns error? {
     state = "Candidate";
     VoteRequest req = { term: currentTerm, candidateID: currentNode, lastLogIndex: (lengthof log) - 1, lastLogTerm: log[(
         lengthof log) - 1].term };
-    var voteResp = sendVoteRequests(req);
-    match voteResp {
-        int voteCount => {
+    future<int> voteResp = start sendVoteRequests(req);
+    int voteCount = await voteResp;
             //check if another appendEntry came
             if (currentTerm != electionTerm) {
                 return;
@@ -106,16 +117,12 @@ function electLeader() returns error? {
                 }
                 startHeartbeatTimer();
             }
-        }
-        error err => {
-            return err;
-        }
-    }
+
     log:printInfo (currentNode +" is a "+state);
     return ();
 }
 
-function sendVoteRequests(VoteRequest req) returns int|error {
+function sendVoteRequests(VoteRequest req) returns int {
     //votes for itself
     future[] futureVotes;
     foreach node in clientMap {
@@ -190,6 +197,7 @@ function seperate(raftBlockingClient node, VoteRequest req) {
 
         }
         error err => {
+            log:printError("Error from Connector: " + err.message + "\n");
             candVoteLog[node.cfg.url] = 0;
         }
     }
@@ -254,11 +262,29 @@ function heartbeatChannel(raftBlockingClient node) {
                 heartbeatChannel(node);
             }
         }
-        error => {
-            //?? please
+        error err=> {
+            log:printError("Error from Connector: " + err.message + "\n");
+            suspectNodes[node.cfg.url]=node;
         }
     }
     commitEntry();
+}
+
+//executed ones few appendRPC fails
+function failureDetecting() {
+    //send indirect RPC using one nodes
+    //if RPC sucess
+        //check if node is running data restoration
+            //keep node in suspect state for a while
+                //check again till resotration is over
+        //remove from suspect
+    //else
+        //incremnt suspect Rate
+        //if suspectRate > DEAD_LIMIT
+            //commit node as dead
+            //return
+        //else
+            //wait few seconds send again
 }
 
 function commitEntry() {
@@ -309,7 +335,7 @@ function stepDown() {
 }
 
 function resetElectionTimer() {
-    int interval = math:randomInRange(150, 300);
+    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
     timer.stop();
     (function () returns error?) onTriggerFunction = electLeader;
 
@@ -320,7 +346,7 @@ function resetElectionTimer() {
 }
 
 function startHeartbeatTimer() {
-    int interval = 100; //change
+    int interval = HEARTBEAT_TIMEOUT;
     (function () returns error?) onTriggerFunction = sendHeartbeats;
 
     function (error) onErrorFunction = timerError;
@@ -330,7 +356,7 @@ function startHeartbeatTimer() {
 }
 
 function startElectionTimer() {
-    int interval = math:randomInRange(150, 300); //change
+    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
     (function () returns error?) onTriggerFunction = electLeader;
 
     function (error) onErrorFunction = timerError;
@@ -339,17 +365,25 @@ function startElectionTimer() {
     timer.start();
 }
 
+
 function clientRequest(string command) returns boolean {
     if (state == "Leader") {
-        log[lengthof log] = { term: currentTerm, command: command };
+        int entryIndex = lengthof log;
+        log[entryIndex ] = { term: currentTerm, command: command };
         future ee = start sendHeartbeats();
         _ = await ee;
         //check if commited moree
-        return true;
+        if(commitIndex>=entryIndex){
+            return true;
+        }else {
+            return false;
+        }
+
     } else {
         return false;
     }
 }
+
 
 function addNode(string ip) returns ConfigChangeResponse {
     if (state != "Leader") {
@@ -363,7 +397,7 @@ function addNode(string ip) returns ConfigChangeResponse {
 }
 
 function apply(string command)  {
-    if (command.substring(0,2)=="NA"){
+    if (command.substring(0,2)=="NA"){ //NODE ADD
         string ip = command.split(" ")[1];
         raftBlockingClient client;
         grpc:ClientEndpointConfig cc = { url: ip };
@@ -373,6 +407,25 @@ function apply(string command)  {
         matchIndex[ip]=0;
 
     }
+    if (command.substring(0,3)=="NSA"){ //NODE SUSPECT Add
+        string ip = command.split(" ")[1];
+        raftBlockingClient client;
+        grpc:ClientEndpointConfig cc = { url: ip };
+        client.init(cc);
+        suspectNodes[ip]=client;
+    }
+
+    if (command.substring(0,3)=="NSR"){ //NODE SUSPECT Remove
+        string ip = command.split(" ")[1];
+        _ = suspectNodes.remove(ip);
+    }
+
+    if (command.substring(0,2)=="NR"){ //NODE Remove
+        string ip = command.split(" ")[1];
+        _ = clientMap.remove(ip);
+        //shuffle
+    }
+
     log:printInfo (command+" Applied!!");
 }
 

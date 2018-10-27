@@ -82,7 +82,16 @@ service raft bind listener {
 
     clientRequestRPC(endpoint caller, string command, grpc:Headers headers) {
         boolean sucess = clientRequest(command);
-        ConfigChangeResponse res = { sucess: sucess, leaderHint: "noneee" };
+        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
+        error? err = caller->send(res);
+        log:printInfo(err.message but { () => "Client RPC Response : " +
+                res.sucess + " " + res.leaderHint });
+
+        _ = caller->complete();
+    }
+    failCheckRPC(endpoint caller, string command, grpc:Headers headers) {
+        boolean sucess = clientRequest(command);
+        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
         error? err = caller->send(res);
         log:printInfo(err.message but { () => "Client RPC Response : " +
                 res.sucess + " " + res.leaderHint });
@@ -154,10 +163,20 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         currentTerm = untaint term;
         state = "Follower";
         votedFor = "None";
-        startElectionTimer();
+        startElectionTimer();//maybe move this down
         //Leader variable init
     }
-    if (term < currentTerm) {
+
+    //if (term == currentTerm){
+    //    if (votedFor == voteReq.candidateID){
+    //        return true;
+    //    }
+    //    else {
+    //        return false;
+    //    }
+    //}
+
+    if (term < currentTerm) {//<=??
         return (false);
     }
     if votedFor != "None" && votedFor != voteReq.candidateID {
