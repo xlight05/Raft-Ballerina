@@ -15,11 +15,15 @@ import ballerina/config;
 //TODO Merge with cache
 
 
-endpoint raftBlockingClient blockingEp {
+//endpoint raftBlockingClient blockingEp {
+//    url: "http://localhost:3000"
+//};
+
+endpoint http:Client blockingEp {
     url: "http://localhost:3000"
 };
 
-map<raftBlockingClient> clientMap;
+map<http:Client> clientMap;
 int MIN_ELECTION_TIMEOUT = 2000;
 int MAX_ELECTION_TIMEOUT = 2250;
 int HEARTBEAT_TIMEOUT = 1000;
@@ -27,11 +31,11 @@ int HEARTBEAT_TIMEOUT = 1000;
 string leader;
 string state = "Follower";
 int currentTerm;
-LogEntry[] log=[{}];
+LogEntry[] log = [{}];
 string votedFor = "None";
-string currentNode = config:getAsString("ip")+":"+config:getAsString("port");
+string currentNode = config:getAsString("ip") + ":" + config:getAsString("port");
 int commitIndex = 0;
-int lastApplied =0;
+int lastApplied = 0;
 task:Timer? timer;
 task:Timer? heartbeatTimer;
 map<int> candVoteLog;
@@ -40,12 +44,12 @@ map<int> nextIndex;
 map<int> matchIndex;
 
 //failure detector
-map <raftBlockingClient> suspectNodes;
+map<http:Client> suspectNodes;
 
 public function startRaft() {
     //cheat for first node lol
-    log[lengthof log] = { term: 1, command: "NA "+currentNode };
-    apply("NA "+currentNode);
+    log[lengthof log] = { term: 1, command: "NA " + currentNode };
+    apply("NA " + currentNode);
     commitIndex++;
     lastApplied++;
     //raftBlockingClient client;
@@ -65,6 +69,12 @@ public function startRaft() {
     timer = new task:Timer(onTriggerFunction, onErrorFunction,
         interval);
     timer.start();
+
+}
+
+function printStats() {
+    io:println("Current Term :"+currentTerm);
+    io:println("");
 }
 
 public function joinRaft() {
@@ -79,12 +89,12 @@ public function joinRaft() {
     function (error) onErrorFunction = timerError;
 
     timer = new task:Timer(onTriggerFunction, onErrorFunction,
-        interval,delay=interval);
+        interval, delay = interval);
     timer.start();
 }
 
-function electLeader() returns error? {
-    log:printInfo("Starting Leader Election by "+currentNode);
+function electLeader() {
+    log:printInfo("Starting Leader Election by " + currentNode);
     //addNodes();//temp
     if (state == "Leader") {
         timer.stop();
@@ -96,29 +106,31 @@ function electLeader() returns error? {
     state = "Candidate";
     VoteRequest req = { term: currentTerm, candidateID: currentNode, lastLogIndex: (lengthof log) - 1, lastLogTerm: log[(
         lengthof log) - 1].term };
-    future<int> voteResp = start sendVoteRequests(req);
+    future<int> voteResp = start sendVoteRequests(untaint req);
     int voteCount = await voteResp;
-            //check if another appendEntry came
-            if (currentTerm != electionTerm) {
-                return;
-            }
-            int quoram = <int>math:floor(lengthof clientMap / 2.0); //0 for first node
-            if (voteCount < quoram) {
-                state = "Follower";
-                votedFor = "None";
-                heartbeatTimer.stop();//not sure if started
-                resetElectionTimer();
-                //stepdown
-            }else {
-                state = "Leader";
-                timer.stop();
-                foreach i in clientMap {
-                    nextIndex[i.cfg.url] = lengthof log;
-                }
-                startHeartbeatTimer();
-            }
+    //check if another appendEntry came
+    if (currentTerm != electionTerm) {
+        return;
+    }
+    int quoram = <int>math:floor(lengthof clientMap / 2.0);
+    //0 for first node
+    if (voteCount < quoram) {
+        state = "Follower";
+        votedFor = "None";
+        heartbeatTimer.stop();
+        //not sure if started
+        resetElectionTimer();
+        //stepdown
+    } else {
+        state = "Leader";
+        timer.stop();
+        foreach i in clientMap {
+            nextIndex[i.config.url] = lengthof log;
+        }
+        startHeartbeatTimer();
+    }
 
-    log:printInfo (currentNode +" is a "+state);
+    log:printInfo(currentNode + " is a " + state);
     return ();
 }
 
@@ -126,10 +138,10 @@ function sendVoteRequests(VoteRequest req) returns int {
     //votes for itself
     future[] futureVotes;
     foreach node in clientMap {
-        if (node.cfg.url==currentNode){
+        if (node.config.url == currentNode) {
             continue;
         }
-        candVoteLog[node.cfg.url] = -1;
+        candVoteLog[node.config.url] = -1;
         future asyncRes = start seperate(node, req);
         futureVotes[lengthof futureVotes] = asyncRes;
         //ignore current Node
@@ -142,7 +154,7 @@ function sendVoteRequests(VoteRequest req) returns int {
         if (item == 1) {
             count++;
         }
-        if (item==-2){
+        if (item == -2) {
             candVoteLog.clear();
             return 0;
         }
@@ -173,32 +185,29 @@ function sendVoteRequests(VoteRequest req) returns int {
     return count;
 }
 
-function seperate(raftBlockingClient node, VoteRequest req) {
+function seperate(http:Client node, VoteRequest req) {
     blockingEp = node;
 
-    var unionResp = blockingEp->voteResponseRPC(req);
-
+    var unionResp = blockingEp->post("/vote", check <json>req);
     match unionResp {
-        (VoteResponse, grpc:Headers) payload => {
-            VoteResponse result;
-            grpc:Headers resHeaders;
-            (result, resHeaders) = payload;
+        http:Response payload => {
+            VoteResponse result = check <VoteResponse>check payload.getJsonPayload();
             if (result.term > currentTerm) {
-                candVoteLog[node.cfg.url] = -2;
+                candVoteLog[node.config.url] = -2;
                 return;
                 //stepdown
             }
             if (result.granted) {
-                candVoteLog[node.cfg.url] = 1;
+                candVoteLog[node.config.url] = 1;
             }
             else {
-                candVoteLog[node.cfg.url] = 0;
+                candVoteLog[node.config.url] = 0;
             }
 
         }
         error err => {
             log:printError("Error from Connector: " + err.message + "\n");
-            candVoteLog[node.cfg.url] = 0;
+            candVoteLog[node.config.url] = 0;
         }
     }
 }
@@ -210,7 +219,7 @@ function sendHeartbeats() {
     log:printInfo("Sending heartbeats");
     future[] heartbeatAsync;
     foreach node in clientMap {
-        if (node.cfg.url==currentNode){
+        if (node.config.url == currentNode) {
             continue;
         }
         future asy = start heartbeatChannel(node);
@@ -222,11 +231,11 @@ function sendHeartbeats() {
     commitEntry();
 }
 
-function heartbeatChannel(raftBlockingClient node) {
+function heartbeatChannel(http:Client node) {
     if (state != "Leader") {
         return;
     }
-    string peer = node.cfg.url;
+    string peer = node.config.url;
     int nextIndexOfPeer = nextIndex[peer] ?: 0;
     int prevLogIndex = nextIndexOfPeer - 1;
     int prevLogTerm = 0;
@@ -248,12 +257,10 @@ function heartbeatChannel(raftBlockingClient node) {
     };
 
     blockingEp = node;
-    var heartbeatResp = blockingEp->appendEntriesRPC(appendEntry);
+    var heartbeatResp = blockingEp->post("/append", check <json>untaint appendEntry);
     match heartbeatResp {
-        (AppendEntriesResponse, grpc:Headers) payload => {
-            AppendEntriesResponse result;
-            grpc:Headers resHeaders;
-            (result, resHeaders) = payload;
+        http:Response payload => {
+            AppendEntriesResponse result = check <AppendEntriesResponse>check payload.getJsonPayload();
             if (result.sucess) {
                 matchIndex[peer] = result.followerMatchIndex;
                 nextIndex[peer] = result.followerMatchIndex + 1; //atomicc
@@ -262,9 +269,9 @@ function heartbeatChannel(raftBlockingClient node) {
                 heartbeatChannel(node);
             }
         }
-        error err=> {
+        error err => {
             log:printError("Error from Connector: " + err.message + "\n");
-            suspectNodes[node.cfg.url]=node;
+            suspectNodes[node.config.url] = node;
         }
     }
     commitEntry();
@@ -274,17 +281,17 @@ function heartbeatChannel(raftBlockingClient node) {
 function failureDetecting() {
     //send indirect RPC using one nodes
     //if RPC sucess
-        //check if node is running data restoration
-            //keep node in suspect state for a while
-                //check again till resotration is over
-        //remove from suspect
+    //check if node is running data restoration
+    //keep node in suspect state for a while
+    //check again till resotration is over
+    //remove from suspect
     //else
-        //incremnt suspect Rate
-        //if suspectRate > DEAD_LIMIT
-            //commit node as dead
-            //return
-        //else
-            //wait few seconds send again
+    //incremnt suspect Rate
+    //if suspectRate > DEAD_LIMIT
+    //commit node as dead
+    //return
+    //else
+    //wait few seconds send again
 }
 
 function commitEntry() {
@@ -295,7 +302,7 @@ function commitEntry() {
     while (item > commitIndex) {
         int replicatedCount = 0;
         foreach server in clientMap {
-            if (matchIndex[server.cfg.url] == item) {
+            if (matchIndex[server.config.url] == item) {
                 replicatedCount++;
             }
         }
@@ -331,7 +338,7 @@ function timerError(error e) {
 
 
 function stepDown() {
-    
+
 }
 
 function resetElectionTimer() {
@@ -361,7 +368,7 @@ function startElectionTimer() {
 
     function (error) onErrorFunction = timerError;
     timer = new task:Timer(onTriggerFunction, onErrorFunction,
-        interval,delay=interval);
+        interval, delay = interval);
     timer.start();
 }
 
@@ -369,13 +376,13 @@ function startElectionTimer() {
 function clientRequest(string command) returns boolean {
     if (state == "Leader") {
         int entryIndex = lengthof log;
-        log[entryIndex ] = { term: currentTerm, command: command };
+        log[entryIndex] = { term: currentTerm, command: command };
         future ee = start sendHeartbeats();
         _ = await ee;
         //check if commited moree
-        if(commitIndex>=entryIndex){
+        if (commitIndex >= entryIndex) {
             return true;
-        }else {
+        } else {
             return false;
         }
 
@@ -389,44 +396,44 @@ function addNode(string ip) returns ConfigChangeResponse {
     if (state != "Leader") {
         return { sucess: false, leaderHint: leader };
     } else {
-        string command = "NA "+ip;
+        string command = "NA " + ip;
         //or commit
         boolean sucess = clientRequest(command);
         return { sucess: sucess, leaderHint: leader };
     }
 }
 
-function apply(string command)  {
-    if (command.substring(0,2)=="NA"){ //NODE ADD
+function apply(string command) {
+    if (command.substring(0, 2) == "NA") { //NODE ADD
         string ip = command.split(" ")[1];
-        raftBlockingClient client;
-        grpc:ClientEndpointConfig cc = { url: ip };
+        http:Client client;
+        http:ClientEndpointConfig cc = { url: ip, timeoutMillis: HEARTBEAT_TIMEOUT / 3 };
         client.init(cc);
         clientMap[ip] = client;
-        nextIndex[ip]=1;
-        matchIndex[ip]=0;
+        nextIndex[ip] = 1;
+        matchIndex[ip] = 0;
 
     }
-    if (command.substring(0,3)=="NSA"){ //NODE SUSPECT Add
+    if (command.substring(0, 3) == "NSA") { //NODE SUSPECT Add
         string ip = command.split(" ")[1];
-        raftBlockingClient client;
-        grpc:ClientEndpointConfig cc = { url: ip };
+        http:Client client;
+        http:ClientEndpointConfig cc = { url: ip, timeoutMillis: HEARTBEAT_TIMEOUT / 3 };
         client.init(cc);
-        suspectNodes[ip]=client;
+        suspectNodes[ip] = client;
     }
 
-    if (command.substring(0,3)=="NSR"){ //NODE SUSPECT Remove
+    if (command.substring(0, 3) == "NSR") { //NODE SUSPECT Remove
         string ip = command.split(" ")[1];
         _ = suspectNodes.remove(ip);
     }
 
-    if (command.substring(0,2)=="NR"){ //NODE Remove
+    if (command.substring(0, 2) == "NR") { //NODE Remove
         string ip = command.split(" ")[1];
         _ = clientMap.remove(ip);
         //shuffle
     }
 
-    log:printInfo (command+" Applied!!");
+    log:printInfo(command + " Applied!!");
 }
 
 // function isQuoram(int count) returns boolean {

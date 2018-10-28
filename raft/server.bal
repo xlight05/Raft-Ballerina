@@ -2,12 +2,15 @@ import ballerina/grpc;
 import ballerina/io;
 import ballerina/config;
 import ballerina/log;
+import ballerina/http;
 
-endpoint grpc:Listener listener {
-    host: "localhost",
+//endpoint grpc:Listener listener {
+//    host: "localhost",
+//    port: config:getAsInt("port", default = 7000)
+//};
+endpoint http:Listener listener {
     port: config:getAsInt("port", default = 7000)
 };
-
 //map<boolean> voteLog;
 //boolean initVoteLog = voteLogInit();
 
@@ -49,54 +52,92 @@ endpoint grpc:Listener listener {
 //
 //AppendEntries(term, leaderID, prevLogIndex, prevLogTerm, entries[], leaderCommit)
 //-> (term, conflictIndex, conflictTerm, success)
-service raft bind listener {
+@http:ServiceConfig { basePath: "/" }
+service <http:Service> raft bind listener {
     //Internal
-    voteResponseRPC(endpoint caller, VoteRequest voteReq, grpc:Headers headers) {
+
+    @http:ResourceConfig {
+        methods: ["POST"],
+        path: "/vote"
+    }
+    voteResponseRPC(endpoint client, http:Request request) {
+        json jsonPayload = check request.getJsonPayload();
+        VoteRequest voteReq =  check <VoteRequest> jsonPayload;
         log:printInfo("Vote request came from " + voteReq.candidateID);
         boolean granted = voteResponseHandle(voteReq);
         VoteResponse res = { granted: granted, term: currentTerm };
-        error? err = caller->send(res);
-        log:printInfo(err.message but { () => "vote response " +
-                res.term + " " + res.granted });
+        http:Response response;
+        response.setJsonPayload(check <json> res);
 
-        _ = caller->complete();
+        client->respond(response) but {
+            error e => log:printError("Error in responding to vote req", err = e)
+        };
     }
-    appendEntriesRPC(endpoint caller, AppendEntries appendEntry, grpc:Headers headers) {
+    @http:ResourceConfig {
+        methods: ["POST"],
+        path: "/append"
+    }
+    appendEntriesRPC(endpoint client, http:Request request) {
+        json jsonPayload = check request.getJsonPayload();
+        AppendEntries appendEntry =  check <AppendEntries> jsonPayload;
         log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
         AppendEntriesResponse res = heartbeatHandle(appendEntry);
-        error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Append RPC response " +
-                res.term + " " + res.sucess });
-        _ = caller->complete();
+        http:Response response;
+        response.setJsonPayload(untaint check <json> res);
+
+        client->respond(response) but {
+            error e => log:printError("Error in responding to append req", err = e)
+        };
     }
 
     //External
-    addServerRPC(endpoint caller, string ip, grpc:Headers headers) {
+    @http:ResourceConfig {
+        methods: ["POST"],
+        path: "/server"
+    }
+    addServerRPC(endpoint client, http:Request request) {
+        string ip=  check request.getTextPayload();
+        io:println (ip);
         ConfigChangeResponse res = addNode(ip);
-        error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Add server response : " +
-                res.sucess + " " + res.leaderHint });
+        http:Response response;
+        response.setJsonPayload(check <json> res);
 
-        _ = caller->complete();
+        client->respond(response) but {
+            error e => log:printError("Error in responding to add server", err = e)
+        };
     }
 
-    clientRequestRPC(endpoint caller, string command, grpc:Headers headers) {
-        boolean sucess = clientRequest(command);
-        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
-        error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Client RPC Response : " +
-                res.sucess + " " + res.leaderHint });
-
-        _ = caller->complete();
+    @http:ResourceConfig {
+        methods: ["POST"],
+        path: "/client"
     }
-    failCheckRPC(endpoint caller, string command, grpc:Headers headers) {
+    clientRequestRPC(endpoint client, http:Request request) {
+        string command=  check request.getTextPayload();
         boolean sucess = clientRequest(command);
         ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
-        error? err = caller->send(res);
-        log:printInfo(err.message but { () => "Client RPC Response : " +
-                res.sucess + " " + res.leaderHint });
+        http:Response response;
+        response.setJsonPayload(check <json> res);
 
-        _ = caller->complete();
+        client->respond(response) but {
+            error e => log:printError("Error in responding to vote req", err = e)
+        };
+    }
+
+    @http:ResourceConfig {
+        methods: ["POST"],
+        path: "/failCheck"
+    }
+    failCheckRPC(endpoint client, http:Request request) {
+        json jsonPayload = check request.getJsonPayload();
+        string command=  check <string> jsonPayload;
+        boolean sucess = clientRequest(command);
+        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
+        http:Response response;
+        response.setJsonPayload(check <json> res);
+
+        client->respond(response) but {
+            error e => log:printError("Error in responding to vote req", err = e)
+        };
     }
 }
 
@@ -214,3 +255,55 @@ function getTerm(int index) returns int {
     }
 }
 
+
+
+//service raft bind listener {
+//    //Internal
+//    voteResponseRPC(endpoint caller, VoteRequest voteReq, grpc:Headers headers) {
+//        log:printInfo("Vote request came from " + voteReq.candidateID);
+//        boolean granted = voteResponseHandle(voteReq);
+//        VoteResponse res = { granted: granted, term: currentTerm };
+//        error? err = caller->send(res);
+//        log:printInfo(err.message but { () => "vote response " +
+//                res.term + " " + res.granted });
+//
+//        _ = caller->complete();
+//    }
+//    appendEntriesRPC(endpoint caller, AppendEntries appendEntry, grpc:Headers headers) {
+//        log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
+//        AppendEntriesResponse res = heartbeatHandle(appendEntry);
+//        error? err = caller->send(res);
+//        log:printInfo(err.message but { () => "Append RPC response " +
+//                res.term + " " + res.sucess });
+//        _ = caller->complete();
+//    }
+//
+//    //External
+//    addServerRPC(endpoint caller, string ip, grpc:Headers headers) {
+//        ConfigChangeResponse res = addNode(ip);
+//        error? err = caller->send(res);
+//        log:printInfo(err.message but { () => "Add server response : " +
+//                res.sucess + " " + res.leaderHint });
+//
+//        _ = caller->complete();
+//    }
+//
+//    clientRequestRPC(endpoint caller, string command, grpc:Headers headers) {
+//        boolean sucess = clientRequest(command);
+//        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
+//        error? err = caller->send(res);
+//        log:printInfo(err.message but { () => "Client RPC Response : " +
+//                res.sucess + " " + res.leaderHint });
+//
+//        _ = caller->complete();
+//    }
+//    failCheckRPC(endpoint caller, string command, grpc:Headers headers) {
+//        boolean sucess = clientRequest(command);
+//        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
+//        error? err = caller->send(res);
+//        log:printInfo(err.message but { () => "Client RPC Response : " +
+//                res.sucess + " " + res.leaderHint });
+//
+//        _ = caller->complete();
+//    }
+//}
