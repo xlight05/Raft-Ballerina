@@ -53,7 +53,7 @@ endpoint http:Listener listener {
 //AppendEntries(term, leaderID, prevLogIndex, prevLogTerm, entries[], leaderCommit)
 //-> (term, conflictIndex, conflictTerm, success)
 @http:ServiceConfig { basePath: "/" }
-service <http:Service> raft bind listener {
+service<http:Service> raft bind listener {
     //Internal
 
     @http:ResourceConfig {
@@ -61,13 +61,16 @@ service <http:Service> raft bind listener {
         path: "/vote"
     }
     voteResponseRPC(endpoint client, http:Request request) {
+        io:println("Before responding to vote");
+        printStats();
         json jsonPayload = check request.getJsonPayload();
-        VoteRequest voteReq =  check <VoteRequest> jsonPayload;
+        VoteRequest voteReq = check <VoteRequest>jsonPayload;
         log:printInfo("Vote request came from " + voteReq.candidateID);
         boolean granted = voteResponseHandle(voteReq);
         VoteResponse res = { granted: granted, term: currentTerm };
+        io:println(res);
         http:Response response;
-        response.setJsonPayload(check <json> res);
+        response.setJsonPayload(check <json>res);
 
         client->respond(response) but {
             error e => log:printError("Error in responding to vote req", err = e)
@@ -78,12 +81,17 @@ service <http:Service> raft bind listener {
         path: "/append"
     }
     appendEntriesRPC(endpoint client, http:Request request) {
+        io:println("Before respondin to append RPC");
+        io:println(printStats());
         json jsonPayload = check request.getJsonPayload();
-        AppendEntries appendEntry =  check <AppendEntries> jsonPayload;
+        AppendEntries appendEntry = check <AppendEntries>jsonPayload;
         log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
         AppendEntriesResponse res = heartbeatHandle(appendEntry);
+        io:println("After respondin to append RPC");
+        io:println(printStats());
+        io:println(res);
         http:Response response;
-        response.setJsonPayload(untaint check <json> res);
+        response.setJsonPayload(untaint check <json>res);
 
         client->respond(response) but {
             error e => log:printError("Error in responding to append req", err = e)
@@ -96,11 +104,11 @@ service <http:Service> raft bind listener {
         path: "/server"
     }
     addServerRPC(endpoint client, http:Request request) {
-        string ip=  check request.getTextPayload();
-        io:println (ip);
+        string ip = check request.getTextPayload();
+        io:println(ip);
         ConfigChangeResponse res = addNode(ip);
         http:Response response;
-        response.setJsonPayload(check <json> res);
+        response.setJsonPayload(check <json>res);
 
         client->respond(response) but {
             error e => log:printError("Error in responding to add server", err = e)
@@ -112,11 +120,11 @@ service <http:Service> raft bind listener {
         path: "/client"
     }
     clientRequestRPC(endpoint client, http:Request request) {
-        string command=  check request.getTextPayload();
+        string command = check request.getTextPayload();
         boolean sucess = clientRequest(command);
         ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
         http:Response response;
-        response.setJsonPayload(check <json> res);
+        response.setJsonPayload(check <json>res);
 
         client->respond(response) but {
             error e => log:printError("Error in responding to vote req", err = e)
@@ -125,15 +133,57 @@ service <http:Service> raft bind listener {
 
     @http:ResourceConfig {
         methods: ["POST"],
-        path: "/failCheck"
+        path: "/indirect"
+    }
+    indirectRPC(endpoint client, http:Request request) {
+        json reqq = check request.getJsonPayload();
+        string targetIP = check <string> reqq.ip;
+        http:Client target;
+        foreach i in clientMap {
+            if (i.config.url == targetIP) {
+                blockingEp = target;
+                break;
+            }
+        }
+        //TODO High timeout coz data relocation might be affected
+        var resp = blockingEp->get("/failCheck/");
+        json j1;
+        match resp {
+            http:Response payload => {
+                string result = check payload.getTextPayload();
+                boolean relocate;
+                if (result == "true") {
+                    relocate = true;
+                } else {
+                    relocate = false;
+                }
+                j1 = { "status": true, "relocate": relocate };
+            }
+            error err => {
+                j1 = { "status": false, "relocate": false };
+            }
+        }
+        http:Response response;
+        response.setJsonPayload(j1);
+
+        client->respond(response) but {
+            error e => log:printError("Error in responding to vote req", err = e)
+        };
+    }
+
+    @http:ResourceConfig {
+        methods: ["GET"],
+        path: "/failCheck/"
     }
     failCheckRPC(endpoint client, http:Request request) {
-        json jsonPayload = check request.getJsonPayload();
-        string command=  check <string> jsonPayload;
-        boolean sucess = clientRequest(command);
-        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
+        string res;
+        if (isRelocationRunning) {
+            res = "true";
+        } else {
+            res = "false";
+        }
         http:Response response;
-        response.setJsonPayload(check <json> res);
+        response.setTextPayload(res);
 
         client->respond(response) but {
             error e => log:printError("Error in responding to vote req", err = e)
@@ -168,10 +218,10 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
             foreach i in appendEntry.entries{
                 index++;
                 if (getTerm(index) != i.term) {
-                    log[index-1] = i;//not sure
+                    log[index - 1] = i;//not sure
                 }
             }
-            index = index-1;
+            index = index - 1;
             commitIndex = untaint min(appendEntry.leaderCommit, index);
         } else {
             index = 0;
