@@ -7,7 +7,7 @@ import ballerina/http;
 //endpoint grpc:Listener listener {
 //    host: "localhost",
 //    port: config:getAsInt("port", default = 7000)
-//};
+//};listener listner
 endpoint http:Listener listener {
     port: config:getAsInt("port", default = 7000)
 };
@@ -52,23 +52,22 @@ endpoint http:Listener listener {
 //
 //AppendEntries(term, leaderID, prevLogIndex, prevLogTerm, entries[], leaderCommit)
 //-> (term, conflictIndex, conflictTerm, success)
-@http:ServiceConfig { basePath: "/" }
+@http:ServiceConfig { basePath: "/raft" }
 service<http:Service> raft bind listener {
     //Internal
-
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/vote"
     }
     voteResponseRPC(endpoint client, http:Request request) {
-        io:println("Before responding to vote");
-        printStats();
+        //io:println("Before responding to vote");
+        //printStats();
         json jsonPayload = check request.getJsonPayload();
         VoteRequest voteReq = check <VoteRequest>jsonPayload;
         log:printInfo("Vote request came from " + voteReq.candidateID);
         boolean granted = voteResponseHandle(voteReq);
         VoteResponse res = { granted: granted, term: currentTerm };
-        io:println(res);
+        log:printInfo("Vote status for " + voteReq.candidateID + " is " + res.granted);
         http:Response response;
         response.setJsonPayload(check <json>res);
 
@@ -81,15 +80,14 @@ service<http:Service> raft bind listener {
         path: "/append"
     }
     appendEntriesRPC(endpoint client, http:Request request) {
-        io:println("Before respondin to append RPC");
-        io:println(printStats());
+        //io:println("Before respondin to append RPC");
+        //io:println(printStats());
         json jsonPayload = check request.getJsonPayload();
         AppendEntries appendEntry = check <AppendEntries>jsonPayload;
-        log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
         AppendEntriesResponse res = heartbeatHandle(appendEntry);
-        io:println("After respondin to append RPC");
-        io:println(printStats());
-        io:println(res);
+        //io:println("After respondin to append RPC");
+        //io:println(printStats());
+        //io:println(res);
         http:Response response;
         response.setJsonPayload(untaint check <json>res);
 
@@ -105,7 +103,7 @@ service<http:Service> raft bind listener {
     }
     addServerRPC(endpoint client, http:Request request) {
         string ip = check request.getTextPayload();
-        io:println(ip);
+        //io:println(ip);
         ConfigChangeResponse res = addNode(ip);
         http:Response response;
         response.setJsonPayload(check <json>res);
@@ -137,19 +135,20 @@ service<http:Service> raft bind listener {
     }
     indirectRPC(endpoint client, http:Request request) {
         json reqq = check request.getJsonPayload();
-        string targetIP = check <string> reqq.ip;
-        http:Client target;
+        string targetIP = check <string>reqq.ip;
         foreach i in clientMap {
             if (i.config.url == targetIP) {
-                blockingEp = target;
+                io:println("Target IP :"+i.config.url);
+                blockingEp = i;
                 break;
             }
         }
         //TODO High timeout coz data relocation might be affected
-        var resp = blockingEp->get("/failCheck/");
+        var resp = blockingEp->get("/raft/failCheck/");
         json j1;
         match resp {
             http:Response payload => {
+                io:println("Target is up");
                 string result = check payload.getTextPayload();
                 boolean relocate;
                 if (result == "true") {
@@ -160,6 +159,7 @@ service<http:Service> raft bind listener {
                 j1 = { "status": true, "relocate": relocate };
             }
             error err => {
+                io:println("Nop, still down");
                 j1 = { "status": false, "relocate": false };
             }
         }
@@ -173,7 +173,7 @@ service<http:Service> raft bind listener {
 
     @http:ResourceConfig {
         methods: ["GET"],
-        path: "/failCheck/"
+        path: "/failCheck"
     }
     failCheckRPC(endpoint client, http:Request request) {
         string res;
@@ -192,9 +192,6 @@ service<http:Service> raft bind listener {
 }
 
 function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesResponse {
-    if (state == "Follower") {
-        resetElectionTimer();
-    }
     //initLog();
     AppendEntriesResponse res;
     if (currentTerm < appendEntry.term) {
@@ -202,11 +199,12 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
         currentTerm = untaint appendEntry.term;
         state = "Follower";
         votedFor = "None";
-        heartbeatTimer.stop();
+
     }
     if (currentTerm > appendEntry.term) {
         res = { term: currentTerm, sucess: false };
     } else {
+        resetElectionTimer();
         leader = untaint appendEntry.leaderID;
         state = "Follower";
         boolean sucess = appendEntry.prevLogTerm == 0 || (appendEntry.prevLogIndex < lengthof log && log[appendEntry.
@@ -216,7 +214,7 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
         if (sucess) {
             index = appendEntry.prevLogIndex;
             foreach i in appendEntry.entries{
-                index++;
+                index = index +1;
                 if (getTerm(index) != i.term) {
                     log[index - 1] = i;//not sure
                 }
@@ -235,6 +233,7 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
             lastApplied = i;
         }
     }
+    true -> raftReadyChan;
     return res;
 }
 
@@ -254,7 +253,8 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         currentTerm = untaint term;
         state = "Follower";
         votedFor = "None";
-        startElectionTimer();//maybe move this down
+        //resetElectionTimer();
+        //startElectionTimer();//maybe move this down
         //Leader variable init
     }
 
@@ -287,6 +287,7 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         return (false);
     }
 
+    resetElectionTimer();
     votedFor = untaint voteReq.candidateID;
 
     return true;
