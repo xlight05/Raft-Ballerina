@@ -7,436 +7,543 @@ import ballerina/log;
 import ballerina/config;
 import ballerina/http;
 
+const int VOTE_GRANTED = 1;
+const int VOTE_DECLINED = 0;
+const int FOLLOWER_TERM_IS_HIGHER_THAN_LEADER = -2;
 
-//TODO LOCKS
-//TODO LAG Test
-//TODO Partition Test
-//TODO Merge with cache
-
-
-//endpoint raftBlockingClient blockingEp {
-//    url: "http://localhost:3000"
-//};
-
-endpoint http:Client blockingEp {
-    url: "http://localhost:3000"
+type Node record {
+    string ip;
+    http:Client nodeEndpoint;
+    !...
 };
 
-map<http:Client> clientMap;
-int MIN_ELECTION_TIMEOUT = 2000;
-int MAX_ELECTION_TIMEOUT = 2250;
-int HEARTBEAT_TIMEOUT = 1000;
+# Current node IP
+string currentNode = config:getAsString("raft.ip") + ":" + config:getAsString("raft.port");
 
-string leader;
+http:Client raftEndpoint = new (currentNode);
+
+# Contains http clients raft uses
+map<Node> raftClientMap={};
+
+int MIN_ELECTION_TIMEOUT = config:getAsInt("raft.min.election.timeout", default = 2000);
+int MAX_ELECTION_TIMEOUT = config:getAsInt("raft.max.election.timeout", default = 2500);
+int HEARTBEAT_TIMEOUT = config:getAsInt("raft.heartbeat.timeout", default = 1000);
+
+# Ones heartbeat is recieved each nodes keeps last known leader in this variable
+string leader="";
+
+# The state this server is currently in, can be FOLLOWER, CANDIDATE, or LEADER
 string state = "Follower";
-int currentTerm;
-LogEntry[] log = [{}];
+
+# This is the term this Raft server is currently in
+int currentTerm=0;
+
+# The log is a list of {term, command}, where the command is an opaque
+# value which only holds meaning to the replicated state machine running on
+# top of Raft.
+LogEntry[] log = [{term:0,command:""}];
+
+# This is the Raft peer that this server has voted for in *this* term (if any)
 string votedFor = "None";
-string currentNode = config:getAsString("ip") + ":" + config:getAsString("port");
+
+# The Raft entries up to and including this index are considered committed by
+# Raft, meaning they will not change, and can safely be applied to the state
+# machine.
 int commitIndex = 0;
+
+# The last command in the log to be applied to the state machine.
 int lastApplied = 0;
-task:Timer? timer;
+task:Timer? electionTimer;
 task:Timer? heartbeatTimer;
-map<int> candVoteLog;
+map<int> voteResponsesOfCandidate={};
 
-map<int> nextIndex;
-map<int> matchIndex;
-channel<boolean> raftReadyChan;
+# nextIndex is a guess as to how much of our log (as leader) matches that of
+# each other peer. This is used to determine what entries to send to each peer
+# next.
+map<int> nextIndex={};
 
+# matchIndex is a measurement of how much of our log (as leader) we know to be
+# replicated at each other server.
+map<int> matchIndex={};
+
+# raftReadyChannel helps to notify the application ones raft is ready
+channel<boolean> raftReadyChan = new;
+
+# Suspect node
+# +clientEndpoint - Http client of the suspected node
+# +ip - ip of the client node
+# +suspectRate - Suspect rate of the node. -50 = Recovered , 100 = Dead
 type SuspectNode record {
-    http:Client client;
+    http:Client clientEndpoint;
     string ip;
     int suspectRate;
 };
 
-//failure detector
-int SUSPECT_VALUE = 10; // 1 - 100;
-int FAILURE_TIMEOUT_MILS = 1000;
-map<SuspectNode> suspectNodes;
-boolean isRelocationRunning;
+# Suspect weight
+int SUSPECT_VALUE = config:getAsInt("failure.detector.suspect.value", default = 10);
 
-public function startRaft() {
-    //cheat for first node lol
-    log[lengthof log] = { term: 1, command: "NA " + currentNode };
+int MAX_SUSPECT_VALUE = 100;
+int MIN_SUSPECT_VALUE = -50;
+
+# Timeout for failure detector
+int FAILURE_TIMEOUT_MILS = config:getAsInt("failure.detector.timeout.millis", default = 1000);
+
+# Suspect node list
+map<SuspectNode> suspectNodes={};
+
+
+public function init(string ... existingNodesInCluster) {
+    //Suggestion rest para array suppot for config API
+    if (existingNodesInCluster.length() === 0){
+        string hosts = config:getAsString("raft.hosts");
+        string[] configNodeList = hosts.split(",");
+        if (configNodeList[0] == "") {
+            createCluster();
+        } else {
+            joinCluster(configNodeList);
+        }
+    }else {
+        joinCluster(existingNodesInCluster);
+    }
+}
+
+# Allows uesrs to create the cluster
+function createCluster() {
+    startRaft();
+}
+
+# Allows uesrs to join the cluster
+# + existingClusterMembersInConfig - ips of the nodes in the cluster
+public function joinCluster(string[] existingClusterMembersInConfig) {
+    //sends join request to all nodes specified in config
+    foreach var clusterMemberIP in existingClusterMembersInConfig {
+        http:Response | error serverResponse = sendJoinRequestToExistingRaftServer(clusterMemberIP);
+        if (serverResponse is http:Response) {
+            ClientResponse | error result = ClientResponse.convert(serverResponse.getJsonPayload());
+            if (result is ClientResponse) {
+                //if node is the leader join the cluster
+                if (result.sucess) {
+                    joinRaft();
+                    return;
+                } else {
+                    log:printInfo("No " + clusterMemberIP + " is not the leader");
+                    if (isLeaderHintAvailable(result.leaderHint)) {
+                        requestToJoinClusterFromKnownLeader(result.leaderHint);
+                    }
+                }
+            } else {
+                log:printError("Invalid JSON ",err=result);
+            }
+        } else {
+            log:printError("Node didn't Respond",err=serverResponse);
+        }
+    }
+    waitAndRetrytryJoiningCluster(existingClusterMembersInConfig);
+}
+
+function isLeaderHintAvailable(string leaderHint) returns boolean {
+    if (leaderHint != "") {
+        return true;
+    } else {
+        return false;
+    }
+}
+function sendJoinRequestToExistingRaftServer(string clusterMemberIP) returns http:Response | error {
+    raftEndpoint.__init(clusterMemberIP);
+    return raftEndpoint->post("/raft/server", currentNode);
+}
+
+function waitAndRetrytryJoiningCluster(string[] clusterIpList) {
+    runtime:sleep(1000);
+    joinCluster(clusterIpList);
+}
+
+function requestToJoinClusterFromKnownLeader(string leaderHint) {
+    http:Response | error serverResponse = sendJoinRequestToExistingRaftServer(leaderHint);
+    if (serverResponse is http:Response) {
+        ClientResponse | error result = ClientResponse.convert(serverResponse.getJsonPayload());
+        if (result is ClientResponse) {
+            //if node is the leader join the cluster
+            if (result.sucess) {
+                joinRaft();
+            } else {
+                log:printInfo("No " + leaderHint + " is not the leader");
+                if (isLeaderHintAvailable(result.leaderHint)) {
+                    requestToJoinClusterFromKnownLeader(result.leaderHint);
+                }
+            }
+        } else {
+            log:printError("Invalid JSON ",err=result);
+        }
+    } else {
+        log:printError("Node didn't Respond",err=serverResponse);
+    }
+}
+
+public function startRaft() { //TODO init cluster
+    addCurrentNodeToCluster ();
+    initLeaderVariables ();
+    startLeaderTimeout ();
+    boolean ready;
+    ready =<- raftReadyChan; //signals raft is ready
+}
+
+function addCurrentNodeToCluster () {
+    log[log.length()] = { term: 1, command: "NA " + currentNode };
     apply("NA " + currentNode);
-    commitIndex = commitIndex +1;
-    lastApplied = lastApplied +1;
-    //raftBlockingClient client;
-    //grpc:ClientEndpointConfig cc = { url: currentNode };
-    //client.init(cc);
-    //clientMap[currentNode] = client;
+    commitIndex = commitIndex + 1;
+    lastApplied = lastApplied + 1;
+}
+function initLeaderVariables () {
     nextIndex[currentNode] = 1;
     matchIndex[currentNode] = 0;
+}
 
-
-    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
-
-    (function () returns error?) onTriggerFunction = electLeader;
-
+function startLeaderTimeout (){
+    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT); //random election timeouts to prevent split vote
+    (function () returns error?) onTriggerFunction = electLeader; //election timer trigger
     function (error) onErrorFunction = timerError;
-
-    timer = new task:Timer(onTriggerFunction, onErrorFunction,
+    electionTimer = new task:Timer(onTriggerFunction, onErrorFunction,
         interval);
-    timer.start();
-    //io:println("After starting cluster");
-    //printStats();
-    boolean ready;
-    ready <- raftReadyChan;
+    electionTimer.start();
 }
 
-//function printStats() {
-//    io:println("State :" + state);
-//    io:println("Current Term :" + currentTerm);
-//    io:print("Log :");
-//    io:println(log);
-//    io:println("Commit Index :" + commitIndex);
-//    io:println("Leader Vars ");
-//    io:println("Next Index :");
-//    foreach k, v in nextIndex {
-//        io:println(k + " : " + v);
-//    }
-//    io:println("Match Index :");
-//    foreach k, v in matchIndex {
-//        io:println(k + " : " + v);
-//    }
-//    io:println("Client list :");
-//    foreach i in clientMap{
-//        io:println(i.config.url);
-//    }
-//    io:println();
-//}
-
-public function joinRaft() {
-    nextIndex[currentNode] = 1;
-    matchIndex[currentNode] = 0;
-
-
-    int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
-
-    (function () returns error?) onTriggerFunction = electLeader;
-
-    function (error) onErrorFunction = timerError;
-
-    timer = new task:Timer(onTriggerFunction, onErrorFunction,
-        interval, delay = interval);
-    timer.start();
-    //io:println("After joining cluster");
-    //printStats();
+public function joinRaft() { //TODO join cluster
+    initLeaderVariables ();
+    startLeaderTimeout ();
     boolean ready;
-    ready <- raftReadyChan;
+    ready =<- raftReadyChan; //signals raft is ready
 }
 
-function electLeader() {
+function getQuorum () returns int{
+    return (<int>math:ceil(raftClientMap.length() / 2.0));
+}
 
-    //addNodes();//temp
+function electLeader() returns error?{ //TODO startLeaderElection
+    //if not leader return
     if (state == "Leader") {
         //timer.stop();
         return;
     }
     log:printInfo("Starting Leader Election by " + currentNode);
-    currentTerm = currentTerm +1;
+    currentTerm = currentTerm + 1;
     int electionTerm = currentTerm;
     votedFor = currentNode;
     state = "Candidate";
-    VoteRequest req = { term: currentTerm, candidateID: currentNode, lastLogIndex: (lengthof log) - 1, lastLogTerm: log[(
-        lengthof log) - 1].term };
-    //io:print("Sending vote Request :");
-    //io:println(req);
-    future<int> voteResp = start sendVoteRequests(untaint req);
-    int voteCount = await voteResp;
-    //check if another appendEntry came
-    if (currentTerm != electionTerm) {
+    VoteRequest voteRequest = { term: currentTerm, candidateID: currentNode, lastLogIndex: (log.length()) - 1, lastLogTerm: log[(
+        log.length()) - 1].term };
+    int votesRecievedFromCluster = sendVoteRequestsToCluster(untaint voteRequest);
+    if (currentTerm != electionTerm) { //check if another appendEntry came while waitting for vote responses
+        log:printInfo ("Term changed while waitting for vote responses. Returning");
         return;
     }
-    int quoram = <int>math:ceil(lengthof clientMap / 2.0);
-    log:printInfo(voteCount + " out of " + lengthof clientMap);
+    int quoram = getQuorum();
+    log:printInfo(votesRecievedFromCluster + " out of " + raftClientMap.length());
     //0 for first node
-    if (voteCount < quoram) {
+    if (votesRecievedFromCluster < quoram) {
         state = "Follower";
         votedFor = "None";
         //heartbeatTimer.stop();
-        //not sure if started
-        //stepdown
     } else {
         state = "Leader";
+        leader = currentNode;
         //timer.stop();
-        foreach i in clientMap {
-            nextIndex[i.config.url] = lengthof log;
+        foreach var (index,node) in raftClientMap {
+            nextIndex[node.ip] = log.length();
         }
         startHeartbeatTimer();
-        //startProcessingSuspects();
+        startProcessingSuspects();
     }
     resetElectionTimer();
     log:printInfo(currentNode + " is a " + state);
-    true -> raftReadyChan;
-    //io:println("After electing Leader");
-    //printStats();
+    //TODO revist channels
+    true -> raftReadyChan; // signal raft is ready
     return ();
 }
 
-function sendVoteRequests(VoteRequest req) returns int {
+function sendVoteRequestsToCluster(VoteRequest req) returns int {
     //votes for itself
-    future[] futureVotes;
-    foreach node in clientMap {
-        if (node.config.url == currentNode) {
+    future<()>[] futureVotes=[];
+    foreach var (index,node) in raftClientMap {
+        if (node.ip == currentNode) {
             continue;
         }
-        candVoteLog[node.config.url] = -1;
-        future asyncRes = start seperate(node, req);
-        futureVotes[lengthof futureVotes] = asyncRes;
+        voteResponsesOfCandidate[node.ip] = -1;
+        //sends async vote requests
+        future<()> asyncRes = start sendVoteRequestToSeperateNode(node, req);
+        futureVotes[futureVotes.length()] = asyncRes;
         //ignore current Node
     }
-    foreach i in futureVotes { //change this in to quoram
-        _ = await i;
+    foreach var i in futureVotes { //change this in to quoram
+        //waits for vote requests
+        _ = wait i;
     }
-    int count = 1;
-    foreach item in candVoteLog {
-        if (item == 1) {
-            count= count +1;
+    int candidateVoteCount = 1;
+    foreach var (index,voteStatus) in voteResponsesOfCandidate {
+        if (voteStatus == VOTE_GRANTED) {
+            //increment votes
+            candidateVoteCount = candidateVoteCount + 1;
         }
-        if (item == -2) {
-            candVoteLog.clear();
+        if (voteStatus == FOLLOWER_TERM_IS_HIGHER_THAN_LEADER) {
+            //a node has higher term, stepdown
+            voteResponsesOfCandidate.clear();
             return 0;
         }
     }
-    candVoteLog.clear();
-    //int count;
-    ////busy while :/ fix using future map
-    //while (true) {
-    //    runtime:
-    //    sleep(50);
-    //    count = 0;
-    //    foreach item in candVoteLog {
-    //        if (item == 1) {
-    //            count++;
-    //        }
-    //    }
-    //    if (count > math:floor(<int>lengthof clientMap / 2.0)) {
-    //        break;
-    //    } else {
-    //        //wait a bit
-    //        runtime:sleep(100);
-    //        //change // 150/2
-    //        //check again
-    //        break;
-    //    }
-    //}
-
-    return count;
+    voteResponsesOfCandidate.clear();
+    return candidateVoteCount;
 }
 
-function seperate(http:Client node, VoteRequest req) {
-    blockingEp = node;
-
-    var unionResp = blockingEp->post("/raft/vote", check <json>req);
-    match unionResp {
-        http:Response payload => {
-            VoteResponse result = check <VoteResponse>check payload.getJsonPayload();
-            if (result.term > currentTerm) {
-                candVoteLog[node.config.url] = -2;
-                return;
-                //stepdown
+function sendVoteRequestToSeperateNode(Node node, VoteRequest voteRequest) {
+    json|error requestJSON = json.convert(voteRequest);
+    if (requestJSON is json){
+        raftEndpoint = node.nodeEndpoint;
+        var voteResponse = raftEndpoint->post("/raft/vote", requestJSON);
+        if (voteResponse is http:Response){
+            VoteResponse|error voteResponseFromClusterNode = VoteResponse.convert (voteResponse.getJsonPayload());
+            if (voteResponseFromClusterNode is VoteResponse){
+                if (voteResponseFromClusterNode.term > currentTerm) {
+                    //target node has higher term. stop election
+                    voteResponsesOfCandidate[node.ip] = FOLLOWER_TERM_IS_HIGHER_THAN_LEADER;
+                    return;
+                    //stepdown
+                }
+                if (voteResponseFromClusterNode.granted) {
+                    //if vote granted
+                    voteResponsesOfCandidate[node.ip] = VOTE_GRANTED;
+                }
+                else {
+                    voteResponsesOfCandidate[node.ip] = VOTE_DECLINED;
+                }
+            }else {
+                log:printError("Invalid JSON", err = voteResponseFromClusterNode);
             }
-            if (result.granted) {
-                candVoteLog[node.config.url] = 1;
-            }
-            else {
-                candVoteLog[node.config.url] = 0;
-            }
-
-        }
-        error err => {
-            log:printError("Voted Request failed: " + err.message + "\n");
-            candVoteLog[node.config.url] = 0;
+        }else {
+                log:printError("Voted Request failed: ",err=voteResponse);
+                voteResponsesOfCandidate[node.ip] = VOTE_DECLINED;
         }
     }
 }
 
-function sendHeartbeats() {
-    io:println("Sending heartbeats");
+function sendHeartbeats() returns error?{
+    //return if node is not leader
     if (state != "Leader") {
         return;
     }
-    future[] heartbeatAsync;
-    foreach node in clientMap {
-        if (node.config.url == currentNode) {
+    future <()> [] heartbeatAsync=[];
+    foreach var (index,node) in raftClientMap {
+        if (node.ip == currentNode) {
             continue;
         }
-        future asy = start heartbeatChannel(node);
-        heartbeatAsync[lengthof heartbeatAsync] = asy;
+        //sends heartbeats async
+        future<()> asy = start heartbeatChannel(node);
+        heartbeatAsync[heartbeatAsync.length()] = asy;
     }
-    foreach item in heartbeatAsync {
-        var x = await item;
+    foreach var item in heartbeatAsync {
+        //wait for heartbeat responses
+        _ = wait item;
     }
+    //start committing entries
     commitEntry();
-    //io:println("After sending all heartbeats");
-    //io:println(printStats());
+    return ();
 }
 
-function heartbeatChannel(http:Client node) {
+function heartbeatChannel(Node node) {
     if (state != "Leader") {
         return;
     }
-    string peer = node.config.url;
-    int nextIndexOfPeer = nextIndex[peer] ?: 0;
-    int prevLogIndex = nextIndexOfPeer - 1;
-    int prevLogTerm = 0;
-    if (prevLogIndex > 0) {
-        prevLogTerm = log[prevLogIndex].term;
+    string peer = node.ip;
+    int nextIndexOfPeer = nextIndex[peer] ?: 0; //Next index to be sent to the peer
+    int prevLogIndexOfPeer = nextIndexOfPeer - 1; //Last Index that needs to be sent to their peer
+    int prevLogTermOfPeer = 0;
+    if (prevLogIndexOfPeer > 0) {
+        prevLogTermOfPeer = log[prevLogIndexOfPeer].term; //last term that needs to be sent to their peer
     }
-    //        int lastEntry = min(lengthof log,nextIndexOfPeer);
-    LogEntry[] entryList;
-    foreach i in prevLogIndex...lengthof log - 1 {
-        entryList[lengthof entryList] = log[i];
+    LogEntry[] entryList=[];
+    foreach var i in prevLogIndexOfPeer...log.length() - 1 {
+        entryList[entryList.length()] = log[i]; //non replicated entry list empty in a healthy heartbeat
     }
     AppendEntries appendEntry = {
         term: currentTerm,
         leaderID: currentNode,
-        prevLogIndex: prevLogIndex,
-        prevLogTerm: log[prevLogIndex].term,
+        prevLogIndex: prevLogIndexOfPeer,
+        prevLogTerm: prevLogTermOfPeer,
         entries: entryList,
         leaderCommit: commitIndex
     };
-    //io:println(appendEntry);
-    //io:println("To " + node.config.url);
-    blockingEp = node;
-    var heartbeatResp = blockingEp->post("/raft/append", check <json>untaint appendEntry);
-    match heartbeatResp {
-        http:Response payload => {
-            AppendEntriesResponse result = check <AppendEntriesResponse>check payload.getJsonPayload();
-            if (result.sucess) {
-                matchIndex[peer] = result.followerMatchIndex;
-                nextIndex[peer] = result.followerMatchIndex + 1; //atomicc
-            } else {
-                nextIndex[peer] = max(1, nextIndexOfPeer - 1);
-                io:println("Another one?");
-                heartbeatChannel(node);
+    json|error appendEntryJSON = json.convert(appendEntry);
+    if (appendEntryJSON is json){
+        raftEndpoint = untaint node.nodeEndpoint;
+        var heartbeatResp = raftEndpoint->post("/raft/append", untaint appendEntryJSON);
+        if (heartbeatResp is http:Response){
+            AppendEntriesResponse|error appendEntryResponse = AppendEntriesResponse.convert(heartbeatResp.getJsonPayload());
+            if (appendEntryResponse is AppendEntriesResponse){
+                if (appendEntryResponse.sucess) { //if node's log is on par with leaders log
+                    matchIndex[peer] = appendEntryResponse.followerMatchIndex;
+                    nextIndex[peer] = appendEntryResponse.followerMatchIndex + 1; //atomicc
+                } else {//if node log is behind with leaders log
+                    nextIndex[peer] = max(1, nextIndexOfPeer - 1);
+                    log:printInfo("Catching up the node with leader");
+                    heartbeatChannel(node);
+                }
+            }
+        }else {
+            log:printError("Heartbeat failed: ", err = heartbeatResp);
+            //begin to suspect
+            boolean found = false;
+            //check if already a suspect
+            foreach var (index,suspect) in suspectNodes {
+                if (suspect.ip == node.ip) {
+                    found = true;
+                }
+            }
+            if (!found) {
+                http:ClientEndpointConfig suspectNodeConfig = {timeoutMillis: 60000 };
+                createSuspectNode(node,suspectNodeConfig);
+                boolean commited = clientRequest("NSA " + node.ip); //commit node as suspected
+                // cant commit here, if doesnt hv majority wut to do
+                log:printInfo(node.ip + " added to suspect list");
+                //commited?
             }
         }
-        error err => {
-            log:printError("Heartbeat failed: " + err.message + "\n");
-            //commit suspect
-            //boolean commited = clientRequest("NSA "+node.config.url);
-            //log:printInfo(node.config.url +" added to suspect list");
-            //commited?
-        }
     }
-    commitEntry();
+}
+function createSuspectNode(Node node,http:ClientEndpointConfig suspectNodeConfig) {
+    http:Client newClient= new (node.ip,config=suspectNodeConfig);
+    SuspectNode sNode = { ip: node.ip, clientEndpoint: newClient, suspectRate: 0 };
+    suspectNodes[node.ip] = sNode;
 }
 
+# Starts processing existing suspects once a new leader is elected
 function startProcessingSuspects() {
-    foreach suspect in suspectNodes {
+    foreach var (index,suspect) in suspectNodes {
         _ = start checkSuspectedNode(suspect);
     }
 }
-//executed ones few appendRPC fails
-//assuming nodes are in suspect state
+function sendIndirectRequestToHealthyNode (SuspectNode node) returns http:Response|error{
+    Node healthyNode = getHealthyNode();
+    log:printInfo("Healthy Node :" + healthyNode.ip);
+    json indirectRequestPayload = { ip: node.ip };
+    //change
+    //increase timeout
+    raftEndpoint = healthyNode.nodeEndpoint;
+    return raftEndpoint->post("/raft/indirect/", indirectRequestPayload);
+}
+
+# Check a suspected node by sending indirect requests periodically.
+# + node- http client of the suspected node
 function checkSuspectedNode(SuspectNode node) {
-    if (state != "Leader"){
+    //TODO maybe backoff factor
+    if (state != "Leader") {
         return;
     }
-    http:Client? clients = getHealthyNode();
-    match clients {
-        http:Client client => {
-            io:println("Healthy Node :"+client.config.url);
-            blockingEp = client;
-            json req = { ip: node.client.config.url };
-            //change
-            //increase timeout
-            var resp = blockingEp->post("/raft/indirect/", req);
-            match resp {
-                http:Response payload => {
-                    json|error result = payload.getJsonPayload();
-                    match result {
-                        json j => {
-                            io:println("Response Recieved :"+ j.toString());
-                            io:println(node.suspectRate);
-                            boolean status = check <boolean>j.status;
-                            if (status) {
-                                boolean relocate = check <boolean>j.relocate;
-                                if (!relocate) {
-                                    //not relocating just slow lol or up noww !
-                                    node.suspectRate = node.suspectRate - SUSPECT_VALUE;
-                                    if (node.suspectRate <= -50) {
-                                        //commit remove from suspect
-                                        boolean commited = clientRequest("NSR " + node.client.config.url);
-                                        log:printInfo(node.client.config.url +" Recovred from suspection");
-                                        //??commited
-                                        return;
-                                    }
-                                }
-                            } else {
-                                //not responding
-                                node.suspectRate = node.suspectRate + SUSPECT_VALUE;
-                                if (node.suspectRate >= 100) {
-                                    //commit dead
-                                    boolean commited = clientRequest("NR " + node.client.config.url);
-                                    log:printInfo(node.client.config.url +" Removed from the cluster");
-                                    return;
-                                }
-                            }
-                            runtime:sleep(FAILURE_TIMEOUT_MILS);
-                            checkSuspectedNode(node);
-                        }
-                        error e => {
-                            log:printError("Error from Connector: " + e.message + "\n");
-                        }
+    http:Response|error responseFromHealthyNode = sendIndirectRequestToHealthyNode(node);
+    if (responseFromHealthyNode is http:Response){
+        var healthyNodeReport = IndirectResponse.convert(responseFromHealthyNode.getJsonPayload());
+        if (healthyNodeReport is IndirectResponse){
+            log:printInfo("Suspect rate of " + node.ip + " : " + node.suspectRate);
+            boolean status = healthyNodeReport.status;
+            if (status) {
+                boolean relocate = healthyNodeReport.relocate;
+                if (!relocate) {
+                    //not relocating just slow lol or up noww !
+                    node.suspectRate = node.suspectRate - SUSPECT_VALUE;
+                    if (node.suspectRate <= MIN_SUSPECT_VALUE) {
+                        //commit remove from suspect
+                        boolean commited = clientRequest("NSR " + node.ip);
+                        log:printInfo(node.ip + " Recovred from suspection " + commited);
+                        //??commited
+                        return;
                     }
-
                 }
-                error err => {
-                    //if healthy node didnt respond
-                    log:printError("Healthy Node didn't respond: " + err.message + "\n");
+            } else {
+                //not responding
+                node.suspectRate = node.suspectRate + SUSPECT_VALUE;
+                if (node.suspectRate >= MAX_SUSPECT_VALUE) {
+                    //commit dead
+                    boolean commited = clientRequest("NR " + node.ip);
+                    log:printInfo(node.ip + " Removed from the cluster");
+                    return;
                 }
             }
-
+            runtime:sleep(FAILURE_TIMEOUT_MILS);
+            checkSuspectedNode(node);
+        } else {
+            log:printError("Invalid Response " ,err = healthyNodeReport);
         }
-        () => {
-            log:printWarn("No Healthy nodes. LOL");
+    }else {
+        //if healthy node didnt respond //could be  be coz of packet loss
+        log:printError("Healthy Node didn't respond: " ,err = responseFromHealthyNode );
+        //this codeblock should be removed after increasing timeouts. for now since both timeouts in current n healthy nodes r same failed request will timeout
+        //
+        node.suspectRate = node.suspectRate + SUSPECT_VALUE;
+        if (node.suspectRate >= MAX_SUSPECT_VALUE) {
+            //commit dead
+            boolean commited = clientRequest("NR " + node.ip);
+            log:printInfo(node.ip + " Removed from the cluster");
+            return;
         }
+        //
+        runtime:sleep(FAILURE_TIMEOUT_MILS);
+        checkSuspectedNode(node);
     }
 }
 
-function getHealthyNode() returns http:Client? {
-    foreach i in clientMap {
-        if (i.config.url==currentNode){
+# Gives a healthy ndoe in the cluster for indirect RPCs
+# +return - Retruns a healthy node or current node if no other healthy nodes available
+function getHealthyNode() returns Node {
+    Node healthyNode={ip:currentNode,nodeEndpoint:raftEndpoint}; //TODO Revisit
+    foreach var (index,node) in raftClientMap {
+        //skip current node first
+        if (node.ip == currentNode) {
             continue;
         }
         boolean inSuspect = false;
-        foreach j in suspectNodes {
-            if (i.config.url == j.ip) {
+        foreach var (suspectIndex,suspectNode) in suspectNodes {
+            if (node.ip == suspectNode.ip) {
                 inSuspect = true;
             }
         }
         if (!inSuspect) {
-            return i;
+            healthyNode = node;
         }
     }
-    //if none return current Node ?
-    return ();
+    //if none return current Node
+    foreach var (index,node) in raftClientMap {
+        if (node.ip == currentNode) {
+            healthyNode = node;
+        }
+    }
+    return healthyNode;
 }
 
+# Commits entries of leaders log
 function commitEntry() {
     if (state != "Leader") {
         return;
     }
-    int item = lengthof log - 1;
-    while (item > commitIndex) {
-        int replicatedCount = 1;
-        foreach server in clientMap {
-            if (server.config.url == currentNode) {
+    int indexOfEntryToBeCommited = log.length() - 1;
+    while (indexOfEntryToBeCommited > commitIndex) {
+        int replicatedCount = 1; //replicated node count
+        foreach var (index,server) in raftClientMap {
+            if (server.ip == currentNode) {
                 continue;
             }
-            if (matchIndex[server.config.url] == item) {
-                replicatedCount = replicatedCount +1;
+            if (matchIndex[server.ip] == indexOfEntryToBeCommited) {
+                replicatedCount = replicatedCount + 1;
             }
         }
-        if (replicatedCount >= math:ceil(lengthof clientMap / 2.0)) {
-            commitIndex = item;
-            apply(log[item].command);
+        //if entry is replicated to a majority of nodes commit
+        if (replicatedCount >= math:ceil(raftClientMap.length() / 2.0)) {
+            commitIndex = indexOfEntryToBeCommited;
+            apply(log[indexOfEntryToBeCommited].command);
+            //To Reduce multiple relocation
+            if (log[indexOfEntryToBeCommited].command.substring(0, 2) == "NA" || log[indexOfEntryToBeCommited].command.substring(0, 2) == "NR") {
+
+            }
             break;
         }
-        item = item - 1;
+        indexOfEntryToBeCommited = indexOfEntryToBeCommited - 1;
     }
 }
 
@@ -461,21 +568,16 @@ function timerError(error e) {
     io:println(e);
 }
 
-
-function stepDown() {
-
-}
-
 function resetElectionTimer() {
     int interval = math:randomInRange(MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT);
     lock {
-        timer.stop();
+        electionTimer.stop();
         (function () returns error?) onTriggerFunction = electLeader;
 
         function (error) onErrorFunction = timerError;
-        timer = new task:Timer(onTriggerFunction, onErrorFunction,
+        electionTimer = new task:Timer(onTriggerFunction, onErrorFunction,
             interval);
-        timer.start();
+        electionTimer.start();
     }
 }
 
@@ -494,38 +596,40 @@ function startElectionTimer() {
     (function () returns error?) onTriggerFunction = electLeader;
 
     function (error) onErrorFunction = timerError;
-    timer = new task:Timer(onTriggerFunction, onErrorFunction,
+    electionTimer = new task:Timer(onTriggerFunction, onErrorFunction,
         interval, delay = interval);
-    timer.start();
+    electionTimer.start();
 }
 
-
+//TODO linearizable semantics
+//TODO Timeout if not committed
 function clientRequest(string command) returns boolean {
     if (state == "Leader") {
-        int entryIndex = lengthof log;
+        int entryIndex = log.length();
         log[entryIndex] = { term: currentTerm, command: command };
-        future ee = start sendHeartbeats();
-        _ = await ee;
-        //check if commited moree
+        future<error?> ee = start sendHeartbeats();
+        _ = wait ee;
+        //without majority no nop :S
+        //check if commited
         if (commitIndex >= entryIndex) {
             return true;
         } else {
             return false;
         }
-
     } else {
         return false;
     }
 }
 
-
-function addNode(string ip) returns ConfigChangeResponse {
-
+# Requests to add a node to the cluster
+# +ip - IP of the new node
+# +return - member join status (sucess or not) , last known leader
+function addNode(string ip) returns ClientResponse {
     if (state != "Leader") {
         return { sucess: false, leaderHint: leader };
     } else {
-        foreach item in clientMap { // temp. check heartbeat commiting agian
-            if (item.config.url == ip) {
+        foreach var (index,item) in raftClientMap { // temp. check heartbeat commiting agian
+            if (item.ip == ip) {
                 return { sucess: false, leaderHint: leader };
             }
         }
@@ -536,68 +640,78 @@ function addNode(string ip) returns ConfigChangeResponse {
     }
 }
 
+# Applies a certain command to the state machine
 function apply(string command) {
     if (command.substring(0, 2) == "NA") { //NODE ADD
         string ip = command.split(" ")[1];
-        //foreach item in clientMap { // temp. check heartbeat commiting agian
-        //    if (item.config.url == ip) {
-        //        return;
-        //    }
-        //}
-        http:Client client;
-        http:ClientEndpointConfig cc = {
-            url: ip,
-            timeoutMillis: HEARTBEAT_TIMEOUT / 3
-            //retryConfig: {
-            //    interval: HEARTBEAT_TIMEOUT/2,
-            //    count: 3,
-            //    backOffFactor: 1.0,
-            //    maxWaitInterval: HEARTBEAT_TIMEOUT/2
-            //}
-        };
-        client.init(cc);
-        clientMap[ip] = client;
-        nextIndex[ip] = 1;
-        matchIndex[ip] = 0;
-
-        // async?  //incositant while catching up a new node?
-        io:println(lengthof clientMap);
-    }
-
-    if (command.substring(0, 3) == "NSA") { //NODE SUSPECT Add
-        string ip = command.split(" ")[1];
-        foreach item in suspectNodes { // temp. check heartbeat commiting agian
+        foreach var (index,item) in raftClientMap { // temp. check heartbeat commiting agian
             if (item.ip == ip) {
                 return;
             }
         }
-        http:Client client;
-        http:ClientEndpointConfig cc = { url: ip, timeoutMillis: 60000 };
-        client.init(cc);
-        SuspectNode node = { ip: ip, client: client, suspectRate: 0 };
+        http:ClientEndpointConfig cc = {
+            timeoutMillis: MIN_ELECTION_TIMEOUT / 3,
+            retryConfig: {
+                interval: 20,
+                count: 1,
+                backOffFactor: 1.0,
+                maxWaitInterval: HEARTBEAT_TIMEOUT / 3
+            }
+        };
+        //http:Client raftClient= new (ip,config=cc);
+        Node raftNode = {ip:ip,nodeEndpoint:createHttpClient(ip,cc)};
+        raftClientMap[ip] = raftNode;
+
+        nextIndex[ip] = 1;
+        matchIndex[ip] = 0;
+    }
+
+    if (command.substring(0, 3) == "NSA") { //NODE SUSPECT Add
+        string ip = command.split(" ")[1];
+        http:ClientEndpointConfig cc = { timeoutMillis: 60000 };
+        SuspectNode node = { ip: ip, clientEndpoint: createHttpClient(ip,cc), suspectRate: 0 };
         suspectNodes[ip] = node;
         _ = start checkSuspectedNode(node);
+        printSuspectedNodes();
     }
 
     if (command.substring(0, 3) == "NSR") { //NODE SUSPECT Remove
         string ip = command.split(" ")[1];
         _ = suspectNodes.remove(ip);
+        printSuspectedNodes();
     }
 
     if (command.substring(0, 2) == "NR") { //NODE Remove
         string ip = command.split(" ")[1];
-        //_ = suspectNodes.remove(ip);
         boolean sucess = clientRequest("NSR " + ip);
         if (sucess) {
-            _ = clientMap.remove(ip);
+            _ = raftClientMap.remove(ip);
+            printSuspectedNodes();
+            printClientNodes();
         }
-
     }
     log:printInfo(command + " Applied!!");
 }
 
-// function isQuoram(int count) returns boolean {
-//     if (count==0){
-//         return true;
-//     }
-// }
+function createHttpClient(string ip,http:ClientEndpointConfig config) returns http:Client{
+    http:Client newRaftClient= new (ip,config=config);
+    return newRaftClient;
+}
+
+# Prints all the nodes in raft
+# Debug only
+function printClientNodes() {
+    io:println("Client map list");
+    foreach var (index,node) in raftClientMap {
+        io:println(node.ip);
+    }
+}
+
+# Prints all the suspected nodes
+# Debug only
+function printSuspectedNodes() {
+    io:println("Suspected node list");
+    foreach var (index,node) in suspectNodes {
+        io:println(node.ip);
+    }
+}

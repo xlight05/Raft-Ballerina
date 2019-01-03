@@ -4,196 +4,243 @@ import ballerina/config;
 import ballerina/log;
 import ballerina/http;
 
-//endpoint grpc:Listener listener {
-//    host: "localhost",
-//    port: config:getAsInt("port", default = 7000)
-//};listener listner
-endpoint http:Listener listener {
-    port: config:getAsInt("port", default = 7000)
+listener http:Listener cacheListner = new(config:getAsInt("raft.port", default = 7000));
+
+# An entry of the replicated log
+# + term- Term of the entry
+# + command - Command to be executed once the entry is commited
+type LogEntry record {
+    int term;
+    string command;
 };
-//map<boolean> voteLog;
-//boolean initVoteLog = voteLogInit();
 
-// public type VoteRequest record{
-//     int term;
-//     string candidateID;
-//     int lastLogIndex;
-//     int lastLogTerm;
-// };
+# Incoming Vote Request from the candidate
+# + term - Candidate's term
+# + candidateID - Candidate's identifier
+# + lastLogIndex - Index of the last log entry of the candidate
+# + lastLogTerm - Term of the last log entry of the candidate
+type VoteRequest record {
+    int term;
+    string candidateID;
+    int lastLogIndex;
+    int lastLogTerm;
+};
 
-// public type VoteResponse record{
-//     boolean granted;
-//     int term;
-// };
+# Response for a candidate vote request
+# + granted - Vote granted status
+# + term - Current term of the reciever's node
+type VoteResponse record {
+    boolean granted;
+    int term;
+};
 
-// public type AppendEntries record {
-//     int term;
-//     string leaderID;
-//     int prevLogIndex;
-//     int prevLogTerm;
-//     LogEntry[] entries;
-//     int leaderCommit;
-// };
+# Heartbeat or new Entry request from the leader
+# + term- Leader's term
+# + leaderID - Leader's identifier
+# + prevLogIndex - Previous log index of the leader
+# + prevLogTerm - Previous log term of the leader
+# + entries - Contains non replicated entries from the leader. Empty for a hearbeat
+# + leaderCommit - Highest commit index of the leader
+type AppendEntries record {
+    int term;
+    string leaderID;
+    int prevLogIndex;
+    int prevLogTerm;
+    LogEntry[] entries;
+    int leaderCommit;
+};
 
-// public type AppendEntriesResponse record {
-//     int term;
-//     boolean sucess;
-//     int followerMatchIndex;
+# Response to a new entry request or heartbeat
+# + term- term of the reciever's node
+# + sucess - notifies if the new entries has been replicated
+# + followerMatchIndex - last commited index of the follower
+type AppendEntriesResponse record {
+    int term;
+    boolean sucess;
+    int followerMatchIndex;
+};
 
-// };
-//  public type LogEntry record {
-//      int term;
-//      string command;
-//  };
-//  type ConfigChangeResponse record{
-//     boolean sucess;
-//     string leaderHint;
-// };
-//
-//AppendEntries(term, leaderID, prevLogIndex, prevLogTerm, entries[], leaderCommit)
-//-> (term, conflictIndex, conflictTerm, success)
+# The reponse for a client intraction. This includes Cluster changes aswell
+# + sucess - status of the client request
+# + leaderHint - last known leader of the cluster
+type ClientResponse record {
+    boolean sucess;
+    string leaderHint;
+};
+
+type IndirectResponse record {
+    boolean status;
+    boolean relocate;
+};
+
 @http:ServiceConfig { basePath: "/raft" }
-service<http:Service> raft bind listener {
-    //Internal
+service raft on cacheListner {
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/vote"
     }
-    voteResponseRPC(endpoint client, http:Request request) {
-        //io:println("Before responding to vote");
-        //printStats();
-        json jsonPayload = check request.getJsonPayload();
-        VoteRequest voteReq = check <VoteRequest>jsonPayload;
-        log:printInfo("Vote request came from " + voteReq.candidateID);
-        boolean granted = voteResponseHandle(voteReq);
-        VoteResponse res = { granted: granted, term: currentTerm };
-        log:printInfo("Vote status for " + voteReq.candidateID + " is " + res.granted);
-        http:Response response;
-        response.setJsonPayload(check <json>res);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to vote req", err = e)
-        };
+    resource function voteResponseRPC(http:Caller caller, http:Request request) {
+        json|error jsonPayload = request.getJsonPayload();
+        http:Response response = new;
+        if (jsonPayload is json){
+            VoteRequest|error voteReq = VoteRequest.convert(jsonPayload);
+            if (voteReq is VoteRequest){
+                log:printInfo("Vote request came from " + voteReq.candidateID);
+                boolean granted = voteResponseHandle(voteReq);
+                VoteResponse voteResponse = { granted: granted, term: currentTerm };
+                log:printInfo("Vote status for " + voteReq.candidateID + " is " + voteResponse.granted);
+                json|error responseJSON = json.convert(voteResponse);
+                if (responseJSON is json){
+                    response.setJsonPayload(responseJSON);
+                }else {
+                    log:printError("Error converting vote to json",err=responseJSON);
+                    response.setJsonPayload ({ granted: false, term: currentTerm });
+                }
+            }else {
+                log:printError("Error converting json to vote request",err=voteReq);
+                response.setJsonPayload ({ granted: false, term: currentTerm });
+            }
+        }else {
+            log:printError("Error parsing JSON ",err=jsonPayload);
+            response.setJsonPayload ({ granted: false, term: currentTerm });
+        }
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to vote request",err=result);
+        }
     }
+
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/append"
     }
-    appendEntriesRPC(endpoint client, http:Request request) {
-        //io:println("Before respondin to append RPC");
-        //io:println(printStats());
-        json jsonPayload = check request.getJsonPayload();
-        AppendEntries appendEntry = check <AppendEntries>jsonPayload;
-        AppendEntriesResponse res = heartbeatHandle(appendEntry);
-        //io:println("After respondin to append RPC");
-        //io:println(printStats());
-        //io:println(res);
-        http:Response response;
-        response.setJsonPayload(untaint check <json>res);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to append req", err = e)
-        };
+    resource function appendEntriesRPC(http:Caller caller, http:Request request) {
+        json|error jsonPayload = json.convert(request.getJsonPayload());
+        http:Response response = new;
+        if (jsonPayload is json){
+            AppendEntries|error appendEntry = AppendEntries.convert(jsonPayload);
+            if (appendEntry is AppendEntries){
+                AppendEntriesResponse appendEntriesResponse = heartbeatHandle(appendEntry);
+                json|error responseJSON = json.convert(appendEntriesResponse);
+                if (responseJSON is json){
+                    response.setJsonPayload(untaint responseJSON);
+                }
+            }else {
+                response.setJsonPayload({ term: currentTerm, sucess: false,followerMatchIndex:0 });
+            }
+        }else {
+            response.setJsonPayload({ term: currentTerm, sucess: false,followerMatchIndex:0 });
+        }
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to append request", err = result);
+        }
     }
 
-    //External
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/server"
     }
-    addServerRPC(endpoint client, http:Request request) {
-        string ip = check request.getTextPayload();
-        //io:println(ip);
-        ConfigChangeResponse res = addNode(ip);
-        http:Response response;
-        response.setJsonPayload(check <json>res);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to add server", err = e)
-        };
+    resource function addServerRPC(http:Caller caller, http:Request request) {
+        string|error ip = request.getTextPayload();
+        http:Response response = new;
+        if (ip is string){
+             ClientResponse configChangeResponse = addNode(ip);
+             json|error responseJSON = json.convert(configChangeResponse);
+             if (responseJSON is json){
+                 response.setJsonPayload(responseJSON);
+             }
+        }else {
+            response.setJsonPayload ({ sucess: false, leaderHint: leader });
+        }
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to add server", err = result);
+        }
     }
 
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/client"
     }
-    clientRequestRPC(endpoint client, http:Request request) {
-        string command = check request.getTextPayload();
-        boolean sucess = clientRequest(command);
-        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
-        http:Response response;
-        response.setJsonPayload(check <json>res);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to vote req", err = e)
-        };
+    resource function clientRequestRPC(http:Caller caller, http:Request request) {
+        string|error command = request.getTextPayload();
+        http:Response response = new;
+        if (command is string){
+            boolean sucess = clientRequest(command);
+            response.setJsonPayload({ sucess: sucess, leaderHint: leader });
+        }else {
+            response.setJsonPayload({ sucess: false, leaderHint: leader });
+        }
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to client request", err = result);
+        }
     }
 
     @http:ResourceConfig {
         methods: ["POST"],
         path: "/indirect"
     }
-    indirectRPC(endpoint client, http:Request request) {
-        json reqq = check request.getJsonPayload();
-        string targetIP = check <string>reqq.ip;
-        foreach i in clientMap {
-            if (i.config.url == targetIP) {
-                io:println("Target IP :"+i.config.url);
-                blockingEp = i;
-                break;
-            }
-        }
-        //TODO High timeout coz data relocation might be affected
-        var resp = blockingEp->get("/raft/failCheck/");
-        json j1;
-        match resp {
-            http:Response payload => {
-                io:println("Target is up");
-                string result = check payload.getTextPayload();
-                boolean relocate;
-                if (result == "true") {
-                    relocate = true;
-                } else {
-                    relocate = false;
+    resource function indirectRPC(http:Caller caller, http:Request request) {
+        json|error reqq = request.getJsonPayload();
+        json responsePayload={};
+        if (reqq is json){
+            string targetIP = reqq.ip.toString();
+            Node? targetNode = raftClientMap[targetIP];
+            if (targetNode is Node){
+                raftEndpoint = targetNode.nodeEndpoint;
+                var resp = raftEndpoint->get("/raft/fail/check/");
+                if (resp is http:Response){
+                    string|error result = resp.getTextPayload();
+                    if (result is string){
+                        boolean relocate;
+                        if (result == "true") {
+                            relocate = true;
+                        } else {
+                            relocate = false;
+                        }
+                        responsePayload = { "status": true, "relocate": relocate };
+                    }else {
+                        responsePayload = { "status": false, "relocate": false };
+                    }
+                }else {
+                    responsePayload = { "status": false, "relocate": false };
                 }
-                j1 = { "status": true, "relocate": relocate };
+                log:printInfo("Indirect ping for " + targetNode.ip + " Server Status : " + responsePayload["status"].
+                    toString());
+            }else {
+                responsePayload = { "status": false, "relocate": false };
             }
-            error err => {
-                io:println("Nop, still down");
-                j1 = { "status": false, "relocate": false };
-            }
+        }else {
+            responsePayload = { "status": false, "relocate": false };
         }
-        http:Response response;
-        response.setJsonPayload(j1);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to vote req", err = e)
-        };
+        http:Response response = new;
+        response.setJsonPayload(responsePayload);
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to indirect ping", err = result);
+        }
     }
 
     @http:ResourceConfig {
         methods: ["GET"],
-        path: "/failCheck"
+        path: "/fail/check"
     }
-    failCheckRPC(endpoint client, http:Request request) {
-        string res;
-        if (isRelocationRunning) {
-            res = "true";
-        } else {
-            res = "false";
-        }
-        http:Response response;
+    resource function failCheckRPC(http:Caller caller, http:Request request) {
+        string res = "false";
+        http:Response response = new;
         response.setTextPayload(res);
-
-        client->respond(response) but {
-            error e => log:printError("Error in responding to vote req", err = e)
-        };
+        var result =caller->respond(response);
+        if (result is error){
+            log:printError("Error in responding to fail check RPC", err = result);
+        }
     }
 }
 
 function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesResponse {
-    //initLog();
     AppendEntriesResponse res;
+    // step down before handling RPC if need be
     if (currentTerm < appendEntry.term) {
         //stepdown
         currentTerm = untaint appendEntry.term;
@@ -201,20 +248,22 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
         votedFor = "None";
 
     }
+    // outdated leader request
     if (currentTerm > appendEntry.term) {
-        res = { term: currentTerm, sucess: false };
+        res = { term: currentTerm, sucess: false,followerMatchIndex:0 };
     } else {
         resetElectionTimer();
         leader = untaint appendEntry.leaderID;
         state = "Follower";
-        boolean sucess = appendEntry.prevLogTerm == 0 || (appendEntry.prevLogIndex < lengthof log && log[appendEntry.
+        boolean sucess = appendEntry.prevLogTerm == 0 || (appendEntry.prevLogIndex < log.length() && log[appendEntry.
                     prevLogIndex].term == appendEntry.prevLogTerm);
-        //can parse entries
         int index = 0;
+        //can parse entries in appendRPC
         if (sucess) {
             index = appendEntry.prevLogIndex;
-            foreach i in appendEntry.entries{
-                index = index +1;
+            //make the log same as leaders log
+            foreach var i in appendEntry.entries{
+                index = index + 1;
                 if (getTerm(index) != i.term) {
                     log[index - 1] = i;//not sure
                 }
@@ -227,28 +276,23 @@ function heartbeatHandle(AppendEntries appendEntry) returns AppendEntriesRespons
         res = { term: currentTerm, sucess: sucess, followerMatchIndex: index };
 
     }
+    //commit entries for the follower
     if (commitIndex > lastApplied) {
-        foreach i in lastApplied + 1...commitIndex {
+        foreach var i in lastApplied + 1...commitIndex {
             apply(log[i].command);
             lastApplied = i;
         }
+        //to avoid too much data relocation
     }
+    //signal raft is ready.
     true -> raftReadyChan;
     return res;
 }
 
-
-
-//function voteLogInit() returns boolean {
-//    foreach node in nodeList {
-//        voteLog[node] = false;
-//    }
-//    return true;
-//}
-
 function voteResponseHandle(VoteRequest voteReq) returns boolean {
     boolean granted;
     int term = voteReq.term;
+    // step down before handling RPC if need be
     if (term > currentTerm) {
         currentTerm = untaint term;
         state = "Follower";
@@ -257,104 +301,42 @@ function voteResponseHandle(VoteRequest voteReq) returns boolean {
         //startElectionTimer();//maybe move this down
         //Leader variable init
     }
-
-    //if (term == currentTerm){
-    //    if (votedFor == voteReq.candidateID){
-    //        return true;
-    //    }
-    //    else {
-    //        return false;
-    //    }
-    //}
-
-    if (term < currentTerm) {//<=??
-        return (false);
+    // don't vote for out-of-date candidates
+    if (term < currentTerm) {
+        return false;
     }
+    // don't double vote
     if votedFor != "None" && votedFor != voteReq.candidateID {
-        return (false);
+        return false;
     }
-    int ourLastLogIndex = (lengthof log) - 1;
+
+    // check how up-to-date our log is
+    int ourLastLogIndex = (log.length()) - 1;
     int ourLastLogTerm = -1;
-    if (lengthof log != 0) {
+    if (log.length() != 0) {
         ourLastLogTerm = log[ourLastLogIndex].term;
     }
-
+    // reject leaders with old logs
     if (voteReq.lastLogTerm < ourLastLogTerm) {
-        return (false);
+        return false;
     }
-
-    if (voteReq.lastLogTerm == ourLastLogTerm && voteReq.lastLogIndex < ourLastLogIndex) { //checkk
-        return (false);
+    // reject leaders with short logs
+    if (voteReq.lastLogTerm == ourLastLogTerm && voteReq.lastLogIndex < ourLastLogIndex) {
+        return false;
     }
-
     resetElectionTimer();
     votedFor = untaint voteReq.candidateID;
-
     return true;
-
-    //
-    //VoteRequest m = voteReq;
-    //if (currentTerm == m.term && votedFor in [None, peer] &&(m.lastLogTerm > logTerm(len(log)) ||(m.lastLogTerm == logTerm(len(log)) &&m.lastLogIndex >= len(log)))):
 }
 
+# Gets term number of a given index
+# + index - Index of the entry
+# + return - term of the entry
 function getTerm(int index) returns int {
-    if (index < 1 || index >= lengthof log) {
+    if (index < 1 || index >= log.length()) {
         return 0;
     }
     else {
         return log[index].term;
     }
 }
-
-
-
-//service raft bind listener {
-//    //Internal
-//    voteResponseRPC(endpoint caller, VoteRequest voteReq, grpc:Headers headers) {
-//        log:printInfo("Vote request came from " + voteReq.candidateID);
-//        boolean granted = voteResponseHandle(voteReq);
-//        VoteResponse res = { granted: granted, term: currentTerm };
-//        error? err = caller->send(res);
-//        log:printInfo(err.message but { () => "vote response " +
-//                res.term + " " + res.granted });
-//
-//        _ = caller->complete();
-//    }
-//    appendEntriesRPC(endpoint caller, AppendEntries appendEntry, grpc:Headers headers) {
-//        log:printInfo("AppendRPC request came from " + appendEntry.leaderID);
-//        AppendEntriesResponse res = heartbeatHandle(appendEntry);
-//        error? err = caller->send(res);
-//        log:printInfo(err.message but { () => "Append RPC response " +
-//                res.term + " " + res.sucess });
-//        _ = caller->complete();
-//    }
-//
-//    //External
-//    addServerRPC(endpoint caller, string ip, grpc:Headers headers) {
-//        ConfigChangeResponse res = addNode(ip);
-//        error? err = caller->send(res);
-//        log:printInfo(err.message but { () => "Add server response : " +
-//                res.sucess + " " + res.leaderHint });
-//
-//        _ = caller->complete();
-//    }
-//
-//    clientRequestRPC(endpoint caller, string command, grpc:Headers headers) {
-//        boolean sucess = clientRequest(command);
-//        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
-//        error? err = caller->send(res);
-//        log:printInfo(err.message but { () => "Client RPC Response : " +
-//                res.sucess + " " + res.leaderHint });
-//
-//        _ = caller->complete();
-//    }
-//    failCheckRPC(endpoint caller, string command, grpc:Headers headers) {
-//        boolean sucess = clientRequest(command);
-//        ConfigChangeResponse res = { sucess: sucess, leaderHint: leader };
-//        error? err = caller->send(res);
-//        log:printInfo(err.message but { () => "Client RPC Response : " +
-//                res.sucess + " " + res.leaderHint });
-//
-//        _ = caller->complete();
-//    }
-//}
