@@ -462,6 +462,7 @@ function checkSuspectedNode(SuspectNode node) {
                 if (node.suspectRate >= MAX_SUSPECT_VALUE) {
                     //commit dead
                     boolean commited = clientRequest("NR " + node.ip);
+                    boolean sucess = clientRequest("NSR " + node.ip);
                     log:printInfo(node.ip + " Removed from the cluster");
                     return;
                 }
@@ -480,6 +481,7 @@ function checkSuspectedNode(SuspectNode node) {
         if (node.suspectRate >= MAX_SUSPECT_VALUE) {
             //commit dead
             boolean commited = clientRequest("NR " + node.ip);
+            boolean sucess = clientRequest("NSR " + node.ip);
             log:printInfo(node.ip + " Removed from the cluster");
             return;
         }
@@ -537,10 +539,6 @@ function commitEntry() {
         if (replicatedCount >= math:ceil(raftClientMap.length() / 2.0)) {
             commitIndex = indexOfEntryToBeCommited;
             apply(log[indexOfEntryToBeCommited].command);
-            //To Reduce multiple relocation
-            if (log[indexOfEntryToBeCommited].command.substring(0, 2) == "NA" || log[indexOfEntryToBeCommited].command.substring(0, 2) == "NR") {
-
-            }
             break;
         }
         indexOfEntryToBeCommited = indexOfEntryToBeCommited - 1;
@@ -672,25 +670,21 @@ function apply(string command) {
         SuspectNode node = { ip: ip, clientEndpoint: createHttpClient(ip,cc), suspectRate: 0 };
         suspectNodes[ip] = node;
         _ = start checkSuspectedNode(node);
-        printSuspectedNodes();
     }
 
     if (command.substring(0, 3) == "NSR") { //NODE SUSPECT Remove
         string ip = command.split(" ")[1];
         _ = suspectNodes.remove(ip);
-        printSuspectedNodes();
     }
 
     if (command.substring(0, 2) == "NR") { //NODE Remove
         string ip = command.split(" ")[1];
-        boolean sucess = clientRequest("NSR " + ip);
-        if (sucess) {
-            _ = raftClientMap.remove(ip);
-            printSuspectedNodes();
-            printClientNodes();
-        }
+        _ = raftClientMap.remove(ip);
     }
     log:printInfo(command + " Applied!!");
+    printClientNodes();
+    printSuspectedNodes();
+    io:println (log);
 }
 
 function createHttpClient(string ip,http:ClientEndpointConfig config) returns http:Client{
